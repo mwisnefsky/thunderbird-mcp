@@ -697,6 +697,46 @@ saveContactWritesBtn.addEventListener("click", async () => {
   saveContactWritesBtn.disabled = false;
 });
 // END OPTIONS CONTACT WRITES
+// BEGIN OPTIONS UNSUBSCRIBE REQUESTS
+const allowUnsubscribeRequestsCheckbox = document.getElementById("allowUnsubscribeRequests");
+const saveUnsubscribeRequestsBtn = document.getElementById("saveUnsubscribeRequestsBtn");
+const saveUnsubscribeRequestsStatus = document.getElementById("saveUnsubscribeRequestsStatus");
+
+async function loadUnsubscribeRequestsPref() {
+  allowUnsubscribeRequestsCheckbox.checked = false;
+  allowUnsubscribeRequestsCheckbox.disabled = true;
+  saveUnsubscribeRequestsBtn.disabled = true;
+  try {
+    const { allowUnsubscribeRequests } = await browser.mcpServer.getAllowUnsubscribeRequests();
+    allowUnsubscribeRequestsCheckbox.checked = allowUnsubscribeRequests === true;
+    allowUnsubscribeRequestsCheckbox.disabled = false;
+    saveUnsubscribeRequestsBtn.disabled = false;
+    saveUnsubscribeRequestsStatus.textContent = "";
+  } catch (e) {
+    saveUnsubscribeRequestsStatus.textContent = "Error loading setting: " + e.message;
+    saveUnsubscribeRequestsStatus.className = "save-status error";
+  }
+}
+
+saveUnsubscribeRequestsBtn.addEventListener("click", async () => {
+  saveUnsubscribeRequestsBtn.disabled = true;
+  saveUnsubscribeRequestsStatus.textContent = "Saving...";
+  saveUnsubscribeRequestsStatus.className = "save-status";
+  try {
+    const result = await browser.mcpServer.setAllowUnsubscribeRequests(allowUnsubscribeRequestsCheckbox.checked);
+    if (result.error) {
+      saveUnsubscribeRequestsStatus.textContent = result.error;
+      saveUnsubscribeRequestsStatus.className = "save-status error";
+    } else {
+      saveUnsubscribeRequestsStatus.textContent = "Saved.";
+    }
+  } catch (e) {
+    saveUnsubscribeRequestsStatus.textContent = "Error: " + e.message;
+    saveUnsubscribeRequestsStatus.className = "save-status error";
+  }
+  saveUnsubscribeRequestsBtn.disabled = false;
+});
+// END OPTIONS UNSUBSCRIBE REQUESTS
 // BEGIN OPTIONS PRIVACY SETTINGS
 const allowEncryptedMessagesCheckbox = document.getElementById("allowEncryptedMessages");
 const allowAllCalendarsCheckbox = document.getElementById("allowAllCalendars");
@@ -751,6 +791,7 @@ loadToolAccess().catch(e => console.error("thunderbird-mcp options:", "loadToolA
 loadSkipReviewPref().catch(e => console.error("thunderbird-mcp options:", "loadSkipReviewPref failed:", e));
 loadFilterSendActionsPref().catch(e => console.error("thunderbird-mcp options:", "loadFilterSendActionsPref failed:", e));
 loadContactWritesPref().catch(e => console.error("thunderbird-mcp options:", "loadContactWritesPref failed:", e));
+loadUnsubscribeRequestsPref().catch(e => console.error("thunderbird-mcp options:", "loadUnsubscribeRequestsPref failed:", e));
 loadPrivacySettings().catch(e => console.error("thunderbird-mcp options:", "loadPrivacySettings failed:", e));
 
 const listenAllCheckbox = document.getElementById("listenAll");

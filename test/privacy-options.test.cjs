@@ -110,6 +110,7 @@ function loadOptions(overrides = {}, apiOverrides = {}) {
     allowEncryptedMessages: "input", allowAllCalendars: "input", allowAllAddressBooks: "input",
     savePrivacyBtn: "button", savePrivacyStatus: "span",
     allowContactWrites: "input", saveContactWritesBtn: "button", saveContactWritesStatus: "span",
+    allowUnsubscribeRequests: "input", saveUnsubscribeRequestsBtn: "button", saveUnsubscribeRequestsStatus: "span",
   })) {
     elements[id] = document.createElement(tagName);
     elements[id].id = id;
@@ -122,12 +123,14 @@ function loadOptions(overrides = {}, apiOverrides = {}) {
     privacySettings: { allowEncryptedMessages: false, allowAllCalendars: false, allowAllAddressBooks: false },
     contactWrites: { allowContactWrites: false },
     contactWritesResult: { success: true },
+    unsubscribeRequests: { allowUnsubscribeRequests: false },
+    unsubscribeRequestsResult: { success: true },
     accountResult: { success: true },
     toolResult: { success: true },
     privacyResult: { success: true },
     ...overrides,
   };
-  const calls = { accounts: [], tools: [], privacy: [], contactWrites: [] };
+  const calls = { accounts: [], tools: [], privacy: [], contactWrites: [], unsubscribeRequests: [] };
   const api = {
     async getAccountAccessConfig() {
       if (state.accountConfig instanceof Error) throw state.accountConfig;
@@ -150,6 +153,15 @@ function loadOptions(overrides = {}, apiOverrides = {}) {
       calls.contactWrites.push(value);
       if (state.contactWritesResult instanceof Error) throw state.contactWritesResult;
       return structuredClone(state.contactWritesResult);
+    },
+    async getAllowUnsubscribeRequests() {
+      if (state.unsubscribeRequests instanceof Error) throw state.unsubscribeRequests;
+      return structuredClone(state.unsubscribeRequests);
+    },
+    async setAllowUnsubscribeRequests(value) {
+      calls.unsubscribeRequests.push(value);
+      if (state.unsubscribeRequestsResult instanceof Error) throw state.unsubscribeRequestsResult;
+      return structuredClone(state.unsubscribeRequestsResult);
     },
     async setAccountAccess(ids) {
       calls.accounts.push(Array.from(ids));
@@ -180,6 +192,7 @@ function loadOptions(overrides = {}, apiOverrides = {}) {
     markedOptionsSnippet("OPTIONS ACCOUNT ACCESS"),
     markedOptionsSnippet("OPTIONS TOOL ACCESS"),
     markedOptionsSnippet("OPTIONS CONTACT WRITES"),
+    markedOptionsSnippet("OPTIONS UNSUBSCRIBE REQUESTS"),
     markedOptionsSnippet("OPTIONS PRIVACY SETTINGS"),
   ].join("\n"), sandbox);
   return {
@@ -188,6 +201,7 @@ function loadOptions(overrides = {}, apiOverrides = {}) {
     loadToolAccess: sandbox.loadToolAccess,
     loadPrivacySettings: sandbox.loadPrivacySettings,
     loadContactWritesPref: sandbox.loadContactWritesPref,
+    loadUnsubscribeRequestsPref: sandbox.loadUnsubscribeRequestsPref,
   };
 }
 
@@ -405,6 +419,72 @@ describe("Options privacy preferences", () => {
   }
 });
 
+describe("Options unsubscribe requests", () => {
+  it("starts unchecked and locked until the stored value has been read", async () => {
+    const ui = loadOptions();
+    ui.allowUnsubscribeRequests.checked = true;
+    ui.allowUnsubscribeRequests.disabled = false;
+    const loading = ui.loadUnsubscribeRequestsPref();
+    assert.equal(ui.allowUnsubscribeRequests.checked, false);
+    assert.equal(ui.allowUnsubscribeRequests.disabled, true);
+    assert.equal(ui.saveUnsubscribeRequestsBtn.disabled, true);
+    await loading;
+    assert.equal(ui.allowUnsubscribeRequests.checked, false);
+    assert.equal(ui.allowUnsubscribeRequests.disabled, false);
+    assert.equal(ui.saveUnsubscribeRequestsBtn.disabled, false);
+  });
+
+  it("loads an enabled value and saves the user's choice", async () => {
+    const ui = loadOptions({ unsubscribeRequests: { allowUnsubscribeRequests: true } });
+    await ui.loadUnsubscribeRequestsPref();
+    assert.equal(ui.allowUnsubscribeRequests.checked, true);
+    ui.allowUnsubscribeRequests.checked = false;
+    await ui.saveUnsubscribeRequestsBtn.fire("click");
+    assert.deepEqual(ui.calls.unsubscribeRequests, [false]);
+    assert.equal(ui.saveUnsubscribeRequestsStatus.textContent, "Saved.");
+    assert.equal(ui.saveUnsubscribeRequestsBtn.disabled, false);
+  });
+
+  it("is independent of the contact writes setting", async () => {
+    const ui = loadOptions({ unsubscribeRequests: { allowUnsubscribeRequests: true } });
+    await ui.loadContactWritesPref();
+    await ui.loadUnsubscribeRequestsPref();
+    assert.equal(ui.allowContactWrites.checked, false);
+    assert.equal(ui.allowUnsubscribeRequests.checked, true);
+    await ui.saveUnsubscribeRequestsBtn.fire("click");
+    assert.deepEqual(ui.calls.contactWrites, []);
+  });
+
+  it("treats anything but true as off", async () => {
+    for (const value of ["true", 1, null, undefined]) {
+      const ui = loadOptions({ unsubscribeRequests: { allowUnsubscribeRequests: value } });
+      await ui.loadUnsubscribeRequestsPref();
+      assert.equal(ui.allowUnsubscribeRequests.checked, false);
+    }
+  });
+
+  it("keeps the setting locked when loading fails", async () => {
+    const ui = loadOptions({ unsubscribeRequests: new Error("unavailable") });
+    await ui.loadUnsubscribeRequestsPref();
+    assert.equal(ui.allowUnsubscribeRequests.checked, false);
+    assert.equal(ui.allowUnsubscribeRequests.disabled, true);
+    assert.match(ui.saveUnsubscribeRequestsStatus.textContent, /Error loading setting/);
+  });
+
+  it("reports a rejected or failed save and re-enables Save", async () => {
+    const ui = loadOptions({ unsubscribeRequestsResult: { error: "denied" } });
+    await ui.loadUnsubscribeRequestsPref();
+    await ui.saveUnsubscribeRequestsBtn.fire("click");
+    assert.equal(ui.saveUnsubscribeRequestsStatus.textContent, "denied");
+    assert.equal(ui.saveUnsubscribeRequestsStatus.className, "save-status error");
+    assert.equal(ui.saveUnsubscribeRequestsBtn.disabled, false);
+    ui.state.unsubscribeRequestsResult = new Error("boom");
+    await ui.saveUnsubscribeRequestsBtn.fire("click");
+    assert.match(ui.saveUnsubscribeRequestsStatus.textContent, /Error: boom/);
+    assert.equal(ui.saveUnsubscribeRequestsBtn.disabled, false);
+  });
+});
+
 describe("Options contact writes", () => {
   it("starts unchecked and locked until the stored value has been read", async () => {
     const ui = loadOptions();
@@ -619,7 +699,7 @@ describe("Options Tool Access upgrades with the production preference API", () =
     await ui.loadToolAccess();
     for (const name of [
       "dryRunCompose", "refreshFolder", "refreshCalendar", "getMessageHeaders", "batchGetMessageHeaders",
-      "createVirtualFolder", "listVirtualFolders", "deleteVirtualFolder", "markFolderRead", "getUnsubscribeInfo",
+      "createVirtualFolder", "listVirtualFolders", "deleteVirtualFolder", "markFolderRead", "getUnsubscribeInfo", "unsubscribe",
     ]) {
       assert.equal(ui.document.getElementById("tool-" + name).checked, false, name);
     }

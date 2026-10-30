@@ -3282,7 +3282,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "updateMessage",
         group: "messages", crud: "update",
         title: "Update Message",
-        description: "Update one or more messages' read/flagged/tagged state and optionally move or copy them. Supply messageId for a single message or messageIds for bulk operations. Tags are Thunderbird keyword keys, not display labels (e.g. '$label1' or 'my=20project'). Invalid keys fail the call before any updates: use printable ASCII without spaces, parentheses, brackets, braces, %, *, double quotes, backslash, <, >, or semicolon. copyTo preserves the source, including existing Gmail labels; moveTo, copyTo, and trash are mutually exclusive. Copy/move is submitted to Thunderbird's copy service, within or across accounts. On IMAP, completion is asynchronous and later failures are not reported back; success means submission only, so verify the destination. Combining tags with copy/move on IMAP may not preserve tags on the destination copy.",
+        description: "Update one or more messages' read/flagged/junk/tagged state and optionally move or copy them. Supply messageId for a single message or messageIds for bulk operations. Tags are Thunderbird keyword keys, not display labels (e.g. '$label1' or 'my=20project'). Invalid keys fail the call before any updates: use printable ASCII without spaces, parentheses, brackets, braces, %, *, double quotes, backslash, <, >, or semicolon. copyTo preserves the source, including existing Gmail labels; moveTo, copyTo, and trash are mutually exclusive. Copy/move is submitted to Thunderbird's copy service, within or across accounts. On IMAP, completion is asynchronous and later failures are not reported back; success means submission only, so verify the destination. Combining tags with copy/move on IMAP may not preserve tags on the destination copy. junk classifies the messages as junk (true) or not junk (false) the way Thunderbird's Junk button does, training its junk filter; moveJunk additionally moves them to the account's Junk folder or, for not-junk messages in a Junk folder, back to its Inbox. Thunderbird's 'delete junk instead of moving' preference is never used, so nothing is deleted. Messages are moved only after the junk filter has finished learning from them, and at most 500 messages are accepted per junk call.",
         inputSchema: {
           type: "object",
           properties: {
@@ -3296,6 +3296,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             moveTo: { type: "string", description: "Destination folder URI for moving messages (optional). Cannot be used with copyTo or trash." },
             copyTo: { type: "string", description: "Destination folder URI for copying messages without removing the source (optional), within or across accessible accounts. On Gmail, adds the destination label while preserving existing labels. Cannot be used with moveTo or trash." },
             trash: { type: "boolean", description: "Set to true to move message to Trash (optional). Cannot be used with moveTo or copyTo." },
+            junk: { type: "boolean", description: "true marks the message(s) as junk, false as not junk (optional). Updates Thunderbird's junk score and trains its junk filter. Does not move anything unless moveJunk is set." },
+            moveJunk: { type: "boolean", description: "With junk, also move the message(s): junk:true to the account's Junk folder; junk:false from a Junk folder back to the Inbox (messages elsewhere stay put). Cannot be used with moveTo, copyTo or trash. Default false." },
           },
           required: ["folderPath"],
         },
@@ -13914,7 +13916,54 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             // BEGIN UPDATE MESSAGE TOOL
-            function updateMessage(messageId, messageIds, folderPath, read, flagged, addTags, removeTags, moveTo, trash, copyTo) {
+            const JUNK_CLASSIFY_TIMEOUT_MS = 30000;
+            const JUNK_BATCH_MAX_MESSAGES = 500;
+
+            // Mirrors nsMsgDBView::SetMsgHdrJunkStatus, which the Junk button uses:
+            // tell the filter about the change (so it trains), then record the
+            // user's verdict and score on the message. Training is asynchronous
+            // (the filter streams the message), and Thunderbird moves junk only
+            // after every classification has been reported back, so this resolves
+            // true once the filter has finished with the message and false if it
+            // failed or did not finish in time.
+            function classifyMessageJunk(folder, db, hdr, isJunk) {
+              return new Promise(resolve => {
+                let settled = false;
+                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                const finish = ok => {
+                  if (settled) return;
+                  settled = true;
+                  try { timer.cancel(); } catch { /* already fired */ }
+                  resolve(ok);
+                };
+                try {
+                  timer.initWithCallback({ notify() { finish(false); } }, JUNK_CLASSIFY_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
+                  const plugin = Ci.nsIJunkMailPlugin;
+                  const oldOrigin = hdr.getStringProperty("junkscoreorigin");
+                  const oldScore = hdr.getStringProperty("junkscore");
+                  let oldClass = plugin.UNCLASSIFIED;
+                  if (oldOrigin && oldOrigin[0] === "u" && oldScore !== "") {
+                    oldClass = Number(oldScore) === plugin.IS_SPAM_SCORE ? plugin.JUNK : plugin.GOOD;
+                  }
+                  MailServices.junk.setMessageClassification(
+                    folder.getUriForMsg(hdr), oldClass, isJunk ? plugin.JUNK : plugin.GOOD, null, {
+                      QueryInterface: ChromeUtils.generateQI(["nsIJunkMailClassificationListener"]),
+                      onMessageClassified() { finish(true); },
+                    });
+                  db.setStringProperty(hdr.messageKey, "junkscoreorigin", "user");
+                  db.setStringProperty(hdr.messageKey, "junkscore", String(isJunk ? plugin.IS_SPAM_SCORE : plugin.IS_HAM_SCORE));
+                } catch {
+                  finish(false);
+                }
+              });
+            }
+
+            // Keep this declaration shape: tests slice the source at "function updateMessage(".
+            function updateMessage(messageId, messageIds, folderPath, read, flagged, addTags, removeTags, moveTo, trash, copyTo, junk, moveJunk) {
+              return updateMessageAsync(messageId, messageIds, folderPath, read, flagged, addTags, removeTags, moveTo, trash, copyTo, junk, moveJunk);
+            }
+
+            async function updateMessageAsync(messageId, messageIds, folderPath, read, flagged, addTags, removeTags, moveTo, trash, copyTo, junk, moveJunk) {
               try {
                 // Normalize to an array of IDs
                 if (typeof messageIds === "string") {
@@ -13937,6 +13986,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (read !== undefined) read = read === true || read === "true";
                 if (flagged !== undefined) flagged = flagged === true || flagged === "true";
                 if (trash !== undefined) trash = trash === true || trash === "true";
+                if (junk !== undefined) junk = junk === true || junk === "true";
+                if (moveJunk !== undefined) moveJunk = moveJunk === true || moveJunk === "true";
+                if (moveJunk && junk === undefined) {
+                  return { error: "moveJunk requires junk" };
+                }
+                if (junk !== undefined && !MailServices.junk?.setMessageClassification) {
+                  return { error: "Thunderbird's junk filter is not available" };
+                }
                 if (moveTo !== undefined && (typeof moveTo !== "string" || !moveTo)) {
                   return { error: "moveTo must be a non-empty string" };
                 }
@@ -13971,6 +14028,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if ([Boolean(moveTo), Boolean(copyTo), trash === true].filter(Boolean).length > 1) {
                   return { error: "Cannot combine moveTo, copyTo, or trash" };
                 }
+                if (moveJunk && (moveTo || copyTo || trash === true)) {
+                  return { error: "moveJunk cannot be combined with moveTo, copyTo, or trash" };
+                }
 
                 // Find all requested message headers
                 const opened = openFolder(folderPath);
@@ -13987,6 +14047,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   targetFolder = targetResult.folder;
                   if (isOutboxFolder(targetFolder)) return { error: OUTBOX_DESTINATION_ERROR };
                   if (isVirtualFolder(targetFolder)) return { error: VIRTUAL_DESTINATION_ERROR };
+                } else if (moveJunk) {
+                  // Resolve the destination ourselves: nsIMsgFolder.performActionsOnJunkMsgs
+                  // deletes instead of moving when the account's manual-mark mode says so.
+                  const inJunkFolder = !!folder.getFlag?.(Ci.nsMsgFolderFlags.Junk);
+                  if (junk && !inJunkFolder) {
+                    targetFolder = folder.server.rootFolder.getFolderWithFlags(Ci.nsMsgFolderFlags.Junk);
+                    if (!targetFolder) return { error: "Junk folder not found" };
+                  } else if (!junk && inJunkFolder) {
+                    targetFolder = folder.server.rootFolder.getFolderWithFlags(Ci.nsMsgFolderFlags.Inbox);
+                    if (!targetFolder) return { error: "Inbox folder not found" };
+                  }
+                  if (targetFolder) {
+                    const targetResult = getAccessibleFolder(targetFolder.URI);
+                    if (targetResult.error) return targetResult;
+                    if (isOutboxFolder(targetFolder)) return { error: OUTBOX_DESTINATION_ERROR };
+                    if (isVirtualFolder(targetFolder)) return { error: VIRTUAL_DESTINATION_ERROR };
+                  }
                 }
 
                 const foundHdrs = [];
@@ -14015,6 +14092,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 if (foundHdrs.length === 0) {
                   return { error: "No matching messages found" };
+                }
+                if (junk !== undefined && foundHdrs.length > JUNK_BATCH_MAX_MESSAGES) {
+                  return { error: `junk accepts at most ${JUNK_BATCH_MAX_MESSAGES} messages per call` };
                 }
 
                 const actions = [];
@@ -14045,11 +14125,31 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                 }
 
+                // Only messages the filter finished learning from may move: a move
+                // can remove the message before the filter has streamed it.
+                let movableHdrs = foundHdrs;
+                if (junk !== undefined) {
+                  const outcomes = await Promise.all(foundHdrs.map(hdr => classifyMessageJunk(folder, db, hdr, junk)));
+                  movableHdrs = foundHdrs.filter((_hdr, index) => outcomes[index]);
+                  const action = { type: "junk", value: junk, classified: movableHdrs.length };
+                  if (movableHdrs.length < foundHdrs.length) action.failed = foundHdrs.length - movableHdrs.length;
+                  actions.push(action);
+                  // Access may have changed while the filter worked.
+                  if (!isFolderAccessible(folder) || (targetFolder && !isFolderAccessible(targetFolder))) {
+                    return { error: "Account access changed while classifying; messages were not moved", actions };
+                  }
+                }
+
                 if (targetFolder) {
                   // Note: on IMAP, tags/flags set above may not transfer to the
                   // destination copy. Thunderbird handles same/cross-account copies.
-                  MailServices.copy.copyMessages(folder, foundHdrs, targetFolder, !copyTo, null, null, false);
-                  actions.push({ type: copyTo ? "copy" : "move", to: targetFolder.URI });
+                  if (movableHdrs.length > 0) {
+                    MailServices.copy.copyMessages(folder, movableHdrs, targetFolder, !copyTo, null, null, false);
+                    actions.push({ type: copyTo ? "copy" : "move", to: targetFolder.URI });
+                  }
+                  if (movableHdrs.length < foundHdrs.length) {
+                    actions.push({ type: "notMoved", count: foundHdrs.length - movableHdrs.length, reason: "the junk filter did not finish classifying them" });
+                  }
                 }
 
                 const result = { success: true, updated: foundHdrs.length, actions };
@@ -15905,7 +16005,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "deleteMessages":
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":
-                  return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.addTags, args.removeTags, args.moveTo, args.trash, args.copyTo);
+                  return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.addTags, args.removeTags, args.moveTo, args.trash, args.copyTo, args.junk, args.moveJunk);
                 case "refreshFolder":
                   return await refreshFolder(args.folderPath, args.timeoutMs);
                 case "createFolder":

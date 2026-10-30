@@ -87,6 +87,7 @@ const ALL_TOOLS = [
   { name: "replyToMessage", group: "messages", crud: "create" },
   { name: "forwardMessage", group: "messages", crud: "create" },
   { name: "updateMessage", group: "messages", crud: "update" },
+  { name: "markFolderRead", group: "messages", crud: "update" },
   { name: "deleteMessages", group: "messages", crud: "delete" },
   { name: "saveDraft", group: "messages", crud: "create" },
   { name: "dryRunCompose", group: "messages", crud: "read" },

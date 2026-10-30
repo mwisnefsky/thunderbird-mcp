@@ -46,6 +46,7 @@ function loadFolderTools({
     TextDecoder,
     Ci: {
       ...makeCi(),
+      nsMsgMessageFlags: { Expunged: 0x8 },
       nsMsgFolderFlags: { Virtual: 0x20, Trash: 0x100, Inbox: 0x1000, AllMail: 0x8000, Junk: 0x40000000, SpecialUse: 0x40405f00 },
       nsITimer: { TYPE_ONE_SHOT: 0 },
       nsIMsgSearchSession: {}, nsINetUtil: netUtil, nsIMsgDBService: {},
@@ -62,7 +63,7 @@ function loadFolderTools({
       "@mozilla.org/msgDatabase/msgDBService;1": { getService: () => ({ openFolderDB, openDBs, cachedDBForFolder, cachedDBForFilePath }) },
     },
     ChromeUtils: { importESModule: () => ({ VirtualFolderHelper: virtualFolderHelper }), generateQI: () => function QueryInterface() { return this; } },
-    Services: { prefs: {
+    Services: { tm: { dispatchToMainThread: callback => setImmediate(callback) }, prefs: {
       getCharPref: (_name, fallback) => fallback,
       getBoolPref: (_name, fallback) => fallback,
     } },
@@ -94,7 +95,11 @@ function loadFolderTools({
     snippet("function toColumnarTable(", "function listFolders("),
     snippet("function listFolders(", "function findIdentityIn("),
     snippet("function openFolder(", "function findMessage("),
+    snippet("const SEARCH_COLLECTION_CAP", "// A folder-scoped search waits"),
+    snippet("function searchTimeExpired(", "function getSearchResultHeader("),
+    snippet("async function scanFolderCooperatively(", "// Thunderbird stores Message-IDs"),
     snippet("// BEGIN UPDATE MESSAGE TOOL", "// END UPDATE MESSAGE TOOL"),
+    snippet("// BEGIN MARK FOLDER READ TOOL", "// END MARK FOLDER READ TOOL"),
     snippet("// BEGIN RAW MIME ATTACHMENT HELPERS", "// END RAW MIME ATTACHMENT HELPERS"),
     snippet("function createFolder(", "function deleteFolder("),
     snippet("function moveFolder(", "// BEGIN FILTER TOOL HANDLERS"),

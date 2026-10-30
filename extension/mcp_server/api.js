@@ -1490,6 +1490,8 @@ const UNDISABLEABLE_TOOLS = new Set(["listAccounts", "listFolders", "getAccountA
 const SEARCH_COLLECTION_CAP = 10000;
 const SEARCH_YIELD_EVERY = 250;
 const SEARCH_TIME_BUDGET_MS = 20000;
+// Keep in sync with the markFolderRead description (the tool schema is built before this point).
+const MARK_FOLDER_READ_MAX_MESSAGES = 10000;
 // A folder-scoped search waits this long for the folder's IMAP sync first.
 const SEARCH_SYNC_TIMEOUT_MS = 5000;
 const DEFAULT_GET_MESSAGES_LIMIT = 10;
@@ -3298,6 +3300,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             trash: { type: "boolean", description: "Set to true to move message to Trash (optional). Cannot be used with moveTo or copyTo." },
             junk: { type: "boolean", description: "true marks the message(s) as junk, false as not junk (optional). Updates Thunderbird's junk score and trains its junk filter. Does not move anything unless moveJunk is set." },
             moveJunk: { type: "boolean", description: "With junk, also move the message(s): junk:true to the account's Junk folder; junk:false from a Junk folder back to the Inbox (messages elsewhere stay put). Cannot be used with moveTo, copyTo or trash. Default false." },
+          },
+          required: ["folderPath"],
+        },
+      },
+      {
+        name: "markFolderRead",
+        group: "messages", crud: "update",
+        title: "Mark Folder Read",
+        description: `Mark every unread message in a folder as read, optionally including subfolders and only messages whose Date header is more than olderThanDays days ago. Reads message headers only, never content. The scan yields to keep Thunderbird responsive, has a best-effort 20-second budget, and marking the messages it found has its own 20-second budget; at most 10,000 messages are handled per call. truncated:true means unread messages may remain, so call again. An IMAP folder that has not been synced recently can look empty or stale: run refreshFolder first. Saved searches and the Outbox are skipped and counted in skippedFolders. On IMAP, marking is submitted to Thunderbird and completes asynchronously; later server failures are not reported back, so verify with searchMessages unreadOnly.`,
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Folder URI from listFolders. An account root is accepted only with includeSubfolders:true." },
+            includeSubfolders: { type: "boolean", description: "Also mark messages in all subfolders (default: false)." },
+            olderThanDays: { type: "number", minimum: 0, description: "Only mark messages whose Date header is more than this many days ago (default: no age limit)." },
           },
           required: ["folderPath"],
         },
@@ -14164,6 +14181,105 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             // END UPDATE MESSAGE TOOL
 
+            // BEGIN MARK FOLDER READ TOOL
+            async function markFolderRead(folderPath, includeSubfolders, olderThanDays) {
+              try {
+                if (typeof folderPath !== "string" || !folderPath) {
+                  return { error: "folderPath must be a non-empty string" };
+                }
+                if (includeSubfolders !== undefined) includeSubfolders = includeSubfolders === true || includeSubfolders === "true";
+                let cutoffMs = null;
+                if (olderThanDays !== undefined && olderThanDays !== null) {
+                  const days = Number(olderThanDays);
+                  if (!Number.isFinite(days) || days < 0) return { error: "olderThanDays must be a non-negative number" };
+                  cutoffMs = Date.now() - days * 86400000;
+                }
+                const opened = getAccessibleFolder(folderPath);
+                if (opened.error) return opened;
+                const top = opened.folder;
+                if (top.isServer && !includeSubfolders) {
+                  return { error: "An account root has no messages of its own; pass includeSubfolders:true or choose a folder" };
+                }
+
+                const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: false };
+                // Marking has its own budget, started when the first keys are ready:
+                // a scan that used up its own time must still mark what it found,
+                // or a repeat call on a huge folder would make no progress.
+                let markScan = null;
+                const result = { success: true, marked: 0, scanned: 0, folders: 0, skippedFolders: 0 };
+                let remaining = MARK_FOLDER_READ_MAX_MESSAGES;
+                let capped = false;
+                let incomplete = false;
+
+                // Native handles live only inside this synchronous frame.
+                function markChunk(folder, keys) {
+                  let db;
+                  try { db = folder.msgDatabase; } catch { db = null; }
+                  if (!db) { incomplete = true; return 0; }
+                  const hdrs = [];
+                  for (const key of keys) {
+                    const hdr = getSearchHeader(db, key);
+                    if (hdr && !hdr.isRead && !(hdr.flags & Ci.nsMsgMessageFlags.Expunged)) hdrs.push(hdr);
+                  }
+                  if (hdrs.length === 0) return 0;
+                  // Folder-level API so IMAP queues the server update.
+                  folder.markMessagesRead(hdrs, true);
+                  return hdrs.length;
+                }
+
+                async function markOne(folder) {
+                  if (!isFolderAccessible(folder) || isVirtualFolder(folder) || isOutboxFolder(folder)) {
+                    result.skippedFolders++;
+                    return;
+                  }
+                  if (!folder.isServer) {
+                    refreshImapFolderSync(folder);
+                    // Phase 1: collect keys only; no header survives a yield.
+                    const keys = [];
+                    const outcome = await scanFolderCooperatively(folder, scan, hdr => {
+                      if (hdr.isRead) return false;
+                      if (cutoffMs !== null && !(hdr.date / 1000 < cutoffMs)) return false;
+                      if (keys.length >= remaining) { capped = true; return true; }
+                      keys.push(hdr.messageKey);
+                      return false;
+                    });
+                    result.scanned += outcome.scanned;
+                    if (!outcome.complete) incomplete = true;
+                    result.folders++;
+                    // Phase 2: mark in synchronous chunks, re-reading headers by key.
+                    for (let index = 0; index < keys.length; index += SEARCH_YIELD_EVERY) {
+                      markScan ||= { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: false };
+                      if (searchTimeExpired(markScan) || !isFolderAccessible(folder)) { incomplete = true; return; }
+                      const marked = markChunk(folder, keys.slice(index, index + SEARCH_YIELD_EVERY));
+                      result.marked += marked;
+                      remaining -= marked;
+                      if (index + SEARCH_YIELD_EVERY < keys.length) {
+                        await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
+                      }
+                    }
+                  }
+                  if (includeSubfolders && folder.hasSubFolders) {
+                    for (const sub of Array.from(folder.subFolders)) {
+                      if (capped || searchTimeExpired(scan)) { incomplete = true; return; }
+                      await markOne(sub);
+                    }
+                  }
+                }
+
+                await markOne(top);
+                if (capped || incomplete || scan.timedOut || markScan?.timedOut) {
+                  result.truncated = true;
+                  result.message = capped
+                    ? `Stopped after ${MARK_FOLDER_READ_MAX_MESSAGES} messages; call again to continue.`
+                    : "The scan did not finish (time budget, folder access or unreadable rows); unread messages may remain. Call again to continue.";
+                }
+                return result;
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+            // END MARK FOLDER READ TOOL
+
             function createFolder(parentFolderPath, name) {
               try {
                 if (typeof parentFolderPath !== "string" || !parentFolderPath) {
@@ -16006,6 +16122,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":
                   return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.addTags, args.removeTags, args.moveTo, args.trash, args.copyTo, args.junk, args.moveJunk);
+                case "markFolderRead":
+                  return await markFolderRead(args.folderPath, args.includeSubfolders, args.olderThanDays);
                 case "refreshFolder":
                   return await refreshFolder(args.folderPath, args.timeoutMs);
                 case "createFolder":

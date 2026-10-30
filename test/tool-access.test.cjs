@@ -119,6 +119,7 @@ const ALL_TOOLS = [
   { name: "deleteEvent", group: "calendar", crud: "delete" },
   { name: "listFilters", group: "filters", crud: "read" },
   { name: "createFilter", group: "filters", crud: "create" },
+  { name: "blockSender", group: "filters", crud: "create" },
   { name: "updateFilter", group: "filters", crud: "update" },
   { name: "reorderFilters", group: "filters", crud: "update" },
   { name: "applyFilters", group: "filters", crud: "update" },

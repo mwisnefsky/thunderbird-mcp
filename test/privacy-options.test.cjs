@@ -699,7 +699,7 @@ describe("Options Tool Access upgrades with the production preference API", () =
     await ui.loadToolAccess();
     for (const name of [
       "dryRunCompose", "refreshFolder", "refreshCalendar", "getMessageHeaders", "batchGetMessageHeaders",
-      "createVirtualFolder", "listVirtualFolders", "deleteVirtualFolder", "markFolderRead", "getUnsubscribeInfo", "unsubscribe",
+      "createVirtualFolder", "listVirtualFolders", "deleteVirtualFolder", "markFolderRead", "getUnsubscribeInfo", "unsubscribe", "blockSender",
     ]) {
       assert.equal(ui.document.getElementById("tool-" + name).checked, false, name);
     }

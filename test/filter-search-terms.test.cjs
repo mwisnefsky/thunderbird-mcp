@@ -66,6 +66,7 @@ this.FILTER_ACTION_VALUE_DESCRIPTION = FILTER_ACTION_VALUE_DESCRIPTION;`,
     vm.runInContext(`${source.slice(handlerStart, handlerEnd)}
 this.listFilters = listFilters;
 this.createFilter = createFilter;
+this.blockSender = blockSender;
 this.updateFilter = updateFilter;
 this.deleteFilter = deleteFilter;
 this.reorderFilters = reorderFilters;
@@ -159,7 +160,7 @@ function buildOneAction(helpers, act, options) {
 function makeFilterHarness({
   ci = makeCi(), allowSend, prefError = false,
   getAccessibleFolder = (uri) => ({ folder: { URI: uri } }),
-  addressBooksRestricted = false,
+  addressBooksRestricted = false, isToolEnabled = () => true,
 } = {}) {
   const prefReads = [];
   const submissions = [];
@@ -226,6 +227,7 @@ function makeFilterHarness({
       isAccountAllowed: (id) => id === account.key,
       isAddressBookAccessRestricted: () => addressBooksRestricted,
       getAccessibleAccounts: () => [account],
+      isToolEnabled,
       getAccessibleFolder,
       MailServices: {
         accounts: { getAccount: (id) => id === account.key ? account : null },
@@ -2400,5 +2402,199 @@ describe("Move/Copy filter actions never target saved searches", () => {
     assert.match(result.error, VIRTUAL_ERROR);
     assert.equal(h.filterList.filterCount, 0);
     assert.equal(h.filterList.saveAttempts, 0);
+  });
+});
+
+describe("blockSender", () => {
+  const JUNK = 0x40000000;
+  const TRASH = 0x100;
+
+  function makeBlockHarness(options = {}) {
+    const ci = options.ci || makeCi();
+    ci.nsMsgFolderFlags = { Junk: JUNK, Trash: TRASH };
+    const h = makeFilterHarness({ ...options, ci });
+    const folders = {
+      [JUNK]: { URI: "imap://account/Junk" },
+      [TRASH]: { URI: "imap://account/Trash" },
+    };
+    h.folder.getFolderWithFlags = (flag) => folders[flag] || null;
+    h.folders = folders;
+    h.account = h.api.getAccessibleAccounts()[0];
+    return h;
+  }
+
+  const summary = (result) => JSON.parse(JSON.stringify(result));
+
+  it("creates an ordinary createFilter rule that moves an address's mail to Junk, first in the list", () => {
+    const h = makeBlockHarness();
+    h.seed({ name: "Older rule" });
+    const result = summary(h.api.blockSender("account", "Spammer@Example.COM"));
+    assert.deepEqual(result, {
+      success: true, alreadyBlocked: false, sender: "spammer@example.com", destination: "junk",
+      folder: "imap://account/Junk", filterName: "Block spammer@example.com", index: 0, filterCount: 2,
+    });
+    const listed = summary(h.api.listFilters("account"))[0].filters;
+    assert.equal(listed[0].name, "Block spammer@example.com");
+    assert.equal(listed[1].name, "Older rule");
+    assert.deepEqual(listed[0].terms.map(t => [t.attrib, t.op, t.value, t.booleanAnd]), [
+      ["from", "contains", "<spammer@example.com>", true],
+      ["from", "is", "spammer@example.com", false],
+    ]);
+    assert.deepEqual(listed[0].actions, [{ type: "moveToFolder", value: "imap://account/Junk" }]);
+    assert.equal(listed[0].enabled, true);
+    assert.equal(h.filterList.saveAttempts, 1);
+  });
+
+  it("blocks a whole domain with anchored conditions and can target Trash", () => {
+    const h = makeBlockHarness();
+    const result = summary(h.api.blockSender("account", "@Bulk.Example.org", "trash"));
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.destination, "trash");
+    const [filter] = summary(h.api.listFilters("account"))[0].filters;
+    assert.deepEqual(filter.terms.map(t => [t.op, t.value]), [["contains", "@bulk.example.org>"], ["endsWith", "@bulk.example.org"]]);
+    assert.deepEqual(filter.actions, [{ type: "moveToFolder", value: "imap://account/Trash" }]);
+  });
+
+  it("accepts internationalized (punycode) top-level domains", () => {
+    const h = makeBlockHarness();
+    const result = summary(h.api.blockSender("account", "@example.xn--p1ai"));
+    assert.equal(result.success, true, result.error);
+    assert.equal(summary(h.api.blockSender("account", "user@mail.example.xn--p1ai")).success, true);
+    assert.equal(summary(h.api.blockSender("account", "@example.xn--")).success, undefined);
+  });
+
+  it("is idempotent: a second call returns the existing rule and writes nothing", () => {
+    const h = makeBlockHarness();
+    h.api.blockSender("account", "spammer@example.com");
+    const before = h.snapshot();
+    const mutations = h.filterList.mutations.length;
+    const again = summary(h.api.blockSender("account", "SPAMMER@example.com", "trash"));
+    assert.equal(again.success, true);
+    assert.equal(again.alreadyBlocked, true);
+    assert.equal(again.existing.name, "Block spammer@example.com");
+    assert.equal(again.existing.index, 0);
+    assert.equal(h.snapshot(), before);
+    assert.equal(h.filterList.mutations.length, mutations);
+    assert.equal(h.filterList.saveAttempts, 1);
+  });
+
+  it("recognizes an equivalent rule created through createFilter, and reports it when disabled", () => {
+    const h = makeBlockHarness();
+    h.api.createFilter("account", "My own block", false, undefined, [
+      { attrib: "from", op: "contains", value: "<a@example.com>", booleanAnd: true },
+      { attrib: "from", op: "is", value: "a@example.com", booleanAnd: false },
+    ], [{ type: "delete" }]);
+    const result = summary(h.api.blockSender("account", "a@example.com"));
+    assert.equal(result.alreadyBlocked, true);
+    assert.equal(result.sameAction, false);
+    assert.equal(result.existing.name, "My own block");
+    assert.match(result.warning, /disabled/);
+    assert.match(result.warning, /does not simply move/);
+    assert.equal(h.filterList.filterCount, 1);
+  });
+
+  it("does not treat a different sender, domain or operator as already blocked", () => {
+    const h = makeBlockHarness();
+    h.api.blockSender("account", "a@example.com");
+    assert.equal(h.api.blockSender("account", "aa@example.com").alreadyBlocked, false);
+    assert.equal(h.api.blockSender("account", "@example.com").alreadyBlocked, false);
+    assert.equal(h.filterList.filterCount, 3);
+  });
+
+  it("rejects malformed senders and destinations without creating anything", () => {
+    const h = makeBlockHarness();
+    for (const sender of [
+      undefined, null, 5, "", "   ", "@", "@com", "example.com", "a@b", "a@@example.com", "a b@example.com",
+      "Name <a@example.com>", "a@example.com, b@example.com", "a@exa mple.com", "@exa_mple.com", "a\nb@example.com",
+      "x".repeat(300) + "@example.com", "@*.example.com", "@-example.com",
+    ]) {
+      const result = h.api.blockSender("account", sender);
+      assert.match(result.error ?? "NO-ERROR", /^sender/, JSON.stringify(sender));
+    }
+    assert.match(h.api.blockSender("account", "a@example.com", "archive").error, /destination/);
+    assert.equal(h.filterList.filterCount, 0);
+    assert.equal(h.filterList.saveAttempts, 0);
+  });
+
+  it("refuses the user's own addresses and domains", () => {
+    const h = makeBlockHarness();
+    h.account.identities = [{ email: "Me@Mydomain.org" }];
+    for (const sender of ["me@mydomain.org", "@mydomain.org", "colleague@mydomain.org"]) {
+      assert.match(h.api.blockSender("account", sender).error, /own identities/, sender);
+    }
+    assert.equal(h.api.blockSender("account", "someone@other.org").success, true);
+  });
+
+  it("honors account restrictions and missing special folders", () => {
+    const h = makeBlockHarness();
+    assert.match(h.api.blockSender("other", "a@example.com").error, /not accessible/);
+    delete h.folders[JUNK];
+    assert.match(h.api.blockSender("account", "a@example.com").error, /no Junk folder/);
+    assert.equal(h.api.blockSender("account", "a@example.com", "trash").success, true);
+  });
+
+  it("checks the destination folder with the account folder access check", () => {
+    const h = makeBlockHarness({ getAccessibleFolder: () => ({ error: "Account not accessible for folder" }) });
+    assert.match(h.api.blockSender("account", "a@example.com").error, /not accessible/);
+    assert.equal(h.filterList.filterCount, 0);
+  });
+
+  it("does not leave a rule behind when saving fails", () => {
+    const h = makeBlockHarness();
+    h.filterList.saveError = true;
+    assert.match(h.api.blockSender("account", "a@example.com").error, /filter save failed/);
+    assert.equal(h.filterList.filterCount, 0);
+  });
+});
+
+describe("blockSender gating and idempotency details", () => {
+  const JUNK = 0x40000000;
+  const TRASH = 0x100;
+  function harness(options = {}) {
+    const ci = makeCi();
+    ci.nsMsgFolderFlags = { Junk: JUNK, Trash: TRASH };
+    const h = makeFilterHarness({ ...options, ci });
+    const folders = { [JUNK]: { URI: "imap://account/Junk" }, [TRASH]: { URI: "imap://account/Trash" } };
+    h.folder.getFolderWithFlags = flag => folders[flag] || null;
+    return h;
+  }
+  const plain = value => JSON.parse(JSON.stringify(value));
+
+  it("refuses to run while createFilter is disabled and writes nothing", () => {
+    const h = harness({ isToolEnabled: name => name !== "createFilter" });
+    assert.match(h.api.blockSender("account", "a@example.com").error, /createFilter/);
+    assert.equal(h.filterList.filterCount, 0);
+    assert.equal(h.filterList.saveAttempts, 0);
+  });
+
+  it("reports sameAction:true when the existing rule already moves to the requested folder", () => {
+    const h = harness();
+    h.api.blockSender("account", "a@example.com", "trash");
+    const again = plain(h.api.blockSender("account", "a@example.com", "trash"));
+    assert.equal(again.alreadyBlocked, true);
+    assert.equal(again.sameAction, true);
+    assert.equal(again.warning, undefined);
+  });
+
+  it("flags an existing rule that files the sender elsewhere than requested, without editing it", () => {
+    const h = harness();
+    h.api.blockSender("account", "a@example.com", "junk");
+    const before = h.snapshot();
+    const again = plain(h.api.blockSender("account", "a@example.com", "trash"));
+    assert.equal(again.alreadyBlocked, true);
+    assert.equal(again.sameAction, false);
+    assert.match(again.warning, /trash folder/);
+    assert.equal(h.snapshot(), before);
+  });
+
+  it("does not treat a rule whose conditions were edited to AND as the same block rule", () => {
+    const h = harness();
+    h.api.createFilter("account", "Edited", true, undefined, [
+      { attrib: "from", op: "contains", value: "<a@example.com>", booleanAnd: true },
+      { attrib: "from", op: "is", value: "a@example.com", booleanAnd: true },
+    ], [{ type: "moveToFolder", value: "imap://account/Junk" }]);
+    const result = plain(h.api.blockSender("account", "a@example.com"));
+    assert.equal(result.alreadyBlocked, false);
+    assert.equal(h.filterList.filterCount, 2);
   });
 });

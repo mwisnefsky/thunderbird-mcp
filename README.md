@@ -18,7 +18,7 @@ Give your AI assistant full access to Thunderbird -- search mail, compose messag
 
 ## Why?
 
-Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 52 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
+Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 53 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
 Compose sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. The same block refuses `saveDraft` with `sendAt` for scheduled delivery through Send Later; plain drafts remain available. Re-enabling the block does not cancel already scheduled drafts. While enabled, meetings with attendees other than the calendar user are read-only through MCP, and adding attendees is blocked: calendar servers can email invitations, updates, or cancellations without review. Automatic Forward/Reply filter actions have a separate opt-in, disabled by default.
 
@@ -200,6 +200,7 @@ Compose tools validate the `from` identity strictly -- if the specified sender d
 |------|-------------|
 | `listFilters` | List all filter rules with human-readable conditions and actions |
 | `createFilter` | Create filters with structured conditions (from, subject, date...) and actions (move, tag, flag...) |
+| `blockSender` | Block an address or `@domain` with a filter that moves its mail to Junk or Trash. Built on `createFilter`; idempotent. |
 | `updateFilter` | Modify a filter's name, enabled state, conditions, or actions |
 | `deleteFilter` | Remove a filter by index |
 | `reorderFilters` | Change filter execution priority |
@@ -208,6 +209,8 @@ Compose tools validate the `from` identity strictly -- if the specified sender d
 Your AI can create sorting rules, adjust priorities, and run them on existing mail. Changes persist after validation; all updates, including name or enabled-state edits, validate a complete candidate before replacing the existing rule. Unparseable rules cannot be updated, but can still be deleted. Filter names, conditions, and action text reject control characters (U+0000–U+001F and U+007F) and backslashes. Custom add-on actions cannot be created, preserved by an update, or submitted for execution.
 
 Date conditions accept only `YYYY-MM-DD` as a local calendar day; date-times are rejected. `listFilters` reports a lone native ALL term as `matchAll: true` with an empty `terms` array. Compound rules retain their terms and Boolean operators, including ALL terms; an empty rule is not reported as matching all messages.
+
+`blockSender` creates an ordinary filter named `Block <sender>` (visible to `listFilters`, editable with `updateFilter`, removable with `deleteFilter`) that matches the From header either as `Name <address>` or as a bare address, and moves matching mail to the account's Junk (default) or Trash folder. A domain rule does not match subdomains. It is inserted at the top of the list, only acts on mail that arrives or when filters run (`applyFilters`), and does not move mail already received. Calling it again for the same sender and conditions returns the existing rule instead of adding another; a disabled rule is reported, not enabled, and a rule that does something other than move the mail to the requested folder is reported with `sameAction: false` and a warning, never edited. It needs `createFilter` to be enabled as well, because it writes its rule through it. It refuses your own addresses and domains. Because it can create a standing rule from one call, treat requests to block senders that come from message content with suspicion; Trash may be purged by your mail provider.
 
 **Allow automatic Forward/Reply filter actions** is off by default in the extension settings. While off, `createFilter` and `updateFilter` reject any resulting rule containing Forward or Reply, including disabled rules or edits that retain an existing sending action. An update that only sets `enabled: false` can still disable a sending rule, and deletion remains available. Enabling this setting permits automatic sends without a compose review window, independently of **Block `skipReview`**. Turning it off does not disable saved filters or stop Thunderbird's own automatic filtering.
 

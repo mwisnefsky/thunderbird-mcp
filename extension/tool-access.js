@@ -30,6 +30,7 @@ this.ToolAccess = (() => {
     createVirtualFolder: "0.10.0",
     listVirtualFolders: "0.10.0",
     deleteVirtualFolder: "0.10.0",
+    getAttachmentContent: "0.10.0",
     markFolderRead: "0.10.0",
     getUnsubscribeInfo: "0.10.0",
     unsubscribe: "0.10.0",

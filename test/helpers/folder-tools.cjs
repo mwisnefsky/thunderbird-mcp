@@ -26,6 +26,7 @@ function loadFolderTools({
   isAddressBookAccessRestricted = () => false,
   openFolderDB = folder => folder.msgDatabase,
   openDBs = [], cachedDBForFolder = () => null, cachedDBForFilePath = () => null,
+  junk, timers = [],
 }) {
   // Thunderbird first escapes a UTF-8 byte string as a path (128/140), then
   // escapes slash as a filename component (153/158). Preserve both URI forms.
@@ -45,16 +46,24 @@ function loadFolderTools({
     TextDecoder,
     Ci: {
       ...makeCi(),
-      nsMsgFolderFlags: { Virtual: 0x20, Trash: 0x100, AllMail: 0x8000, SpecialUse: 0x40405f00 },
+      nsMsgMessageFlags: { Expunged: 0x8 },
+      nsMsgFolderFlags: { Virtual: 0x20, Trash: 0x100, Inbox: 0x1000, AllMail: 0x8000, Junk: 0x40000000, SpecialUse: 0x40405f00 },
+      nsITimer: { TYPE_ONE_SHOT: 0 },
       nsIMsgSearchSession: {}, nsINetUtil: netUtil, nsIMsgDBService: {},
+      nsIJunkMailPlugin: { UNCLASSIFIED: 0, GOOD: 1, JUNK: 2, IS_SPAM_SCORE: 100, IS_HAM_SCORE: 0 },
     },
     Cc: {
       "@mozilla.org/messenger/searchSession;1": { createInstance: makeSearchSession },
       "@mozilla.org/network/io-service;1": { getService: () => netUtil },
+      "@mozilla.org/timer;1": { createInstance() {
+        const timer = { cancelled: false, initWithCallback(callback) { this.callback = callback; }, cancel() { this.cancelled = true; } };
+        timers.push(timer);
+        return timer;
+      } },
       "@mozilla.org/msgDatabase/msgDBService;1": { getService: () => ({ openFolderDB, openDBs, cachedDBForFolder, cachedDBForFilePath }) },
     },
-    ChromeUtils: { importESModule: () => ({ VirtualFolderHelper: virtualFolderHelper }) },
-    Services: { prefs: {
+    ChromeUtils: { importESModule: () => ({ VirtualFolderHelper: virtualFolderHelper }), generateQI: () => function QueryInterface() { return this; } },
+    Services: { tm: { dispatchToMainThread: callback => setImmediate(callback) }, prefs: {
       getCharPref: (_name, fallback) => fallback,
       getBoolPref: (_name, fallback) => fallback,
     } },
@@ -71,6 +80,7 @@ function loadFolderTools({
       },
       folderLookup: { getFolderForURL },
       copy: { copyMessages, copyFolder },
+      junk,
     },
   });
   vm.runInContext([
@@ -85,7 +95,11 @@ function loadFolderTools({
     snippet("function toColumnarTable(", "function listFolders("),
     snippet("function listFolders(", "function findIdentityIn("),
     snippet("function openFolder(", "function findMessage("),
+    snippet("const SEARCH_COLLECTION_CAP", "// A folder-scoped search waits"),
+    snippet("function searchTimeExpired(", "function getSearchResultHeader("),
+    snippet("async function scanFolderCooperatively(", "// Thunderbird stores Message-IDs"),
     snippet("// BEGIN UPDATE MESSAGE TOOL", "// END UPDATE MESSAGE TOOL"),
+    snippet("// BEGIN MARK FOLDER READ TOOL", "// END MARK FOLDER READ TOOL"),
     snippet("// BEGIN RAW MIME ATTACHMENT HELPERS", "// END RAW MIME ATTACHMENT HELPERS"),
     snippet("function createFolder(", "function deleteFolder("),
     snippet("function moveFolder(", "// BEGIN FILTER TOOL HANDLERS"),
